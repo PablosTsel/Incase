@@ -1,0 +1,33 @@
+Evaluation Results for baseline_model_final.pt
+Date: 2025-02-28 01:44:47
+Test-Time Augmentation: True
+
+Confusion Matrix:
+[[36948  3965   326   369]
+ [ 1217  3187   269   125]
+ [  523   439  2686   202]
+ [  522   175   299  2779]]
+
+Classification Report:
+              precision    recall  f1-score   support
+
+   no-damage     0.9423    0.8880    0.9144     41608
+minor-damage     0.4104    0.6642    0.5073      4798
+major-damage     0.7503    0.6977    0.7230      3850
+   destroyed     0.7997    0.7362    0.7666      3775
+
+    accuracy                         0.8440     54031
+   macro avg     0.7257    0.7465    0.7278     54031
+weighted avg     0.8714    0.8440    0.8543     54031
+
+
+Additional Metrics:
+Accuracy: 84.3960%
+Macro F1 Score: 0.7278
+Weighted F1 Score: 0.8543
+Macro Precision: 0.7257
+Weighted Precision: 0.8714
+Macro Recall: 0.7465
+Weighted Recall: 0.8440
+Cohen's Kappa: 0.6278
+Balanced Accuracy: 0.7465

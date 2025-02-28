@@ -1,0 +1,20 @@
+# .gitignore
+
+# Hide the literature folder
+Literature/
+
+# Hide your Python env
+myenv/
+
+output/
+
+# Hide xBD folder
+data/
+
+baseline_model_final.pt
+baseline_model.pt
+
+experiments/
+# You can also ignore other common files:
+__pycache__/
+*.pyc
