@@ -11,8 +11,7 @@ output/
 # Hide xBD folder
 data/
 
-baseline_model_final.pt
-baseline_model.pt
+.cursorignore
 
 experiments/
 # You can also ignore other common files:

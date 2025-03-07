@@ -5,7 +5,7 @@ import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 import numpy as np
 import matplotlib.pyplot as plt
@@ -16,14 +16,361 @@ from sklearn.metrics import (confusion_matrix, classification_report,
                              accuracy_score, roc_auc_score, roc_curve, auc)
 import time
 from datetime import datetime
+import json
+from PIL import Image
+import torchvision.transforms as T
+from shapely import wkt
+import glob
 
-# Add project root to sys.path so we can import our modules
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-sys.path.append(project_root)
+# Constants and definitions
+DAMAGE_LABELS = {
+    "no-damage": 0,
+    "minor-damage": 1,
+    "major-damage": 2,
+    "destroyed": 3
+}
 
-from overlaying_labels.models.baseline_model import BaselineModel
-from options.utils.data_loader import XBDPatchDataset, DAMAGE_LABELS
+# Dataset class
+class XBDPatchDataset(Dataset):
+    """
+    On-the-fly dataset that:
+      - Scans the dataset directory.
+      - In hierarchical mode (flat_structure=False): expects subfolders per disaster (each with an 'images' and 'labels' folder).
+      - In flat mode (flat_structure=True): expects root_dir to contain 'images' and 'labels' folders directly.
+      - For each post-disaster JSON, enumerates building polygons, computes the bounding box, and center-crops the pre & post images.
+      - Returns (pre_patch, post_patch, label) for each building.
+    """
+    def __init__(self,
+                 root_dir,
+                 pre_crop_size=128,
+                 post_crop_size=224,
+                 use_xy=True,
+                 max_samples=None,
+                 flat_structure=False,
+                 augment=False):
+        """
+        :param root_dir: Directory where the data is stored.
+           - If flat_structure is False: root_dir should contain subfolders for each disaster.
+           - If True: root_dir should contain 'images' and 'labels' folders directly.
+        :param pre_crop_size: Crop size for pre-disaster images.
+        :param post_crop_size: Crop size for post-disaster images.
+        :param use_xy: Use 'xy' coordinates if True; else use 'lng_lat'.
+        :param max_samples: Optional limit on the number of samples.
+        :param flat_structure: Whether the folder structure is flat.
+        :param augment: If True, applies data augmentation (random horizontal flip and random rotation).
+        """
+        super().__init__()
+        self.root_dir = root_dir
+        self.pre_crop_size = pre_crop_size
+        self.post_crop_size = post_crop_size
+        self.coord_key = "xy" if use_xy else "lng_lat"
+        self.max_samples = max_samples
+        self.flat_structure = flat_structure
+        self.augment = augment
 
+        # Basic transforms - keeping it simple for compatibility
+        self.pre_transform = T.Compose([
+            T.Resize((pre_crop_size, pre_crop_size)),
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406],
+                        std=[0.229, 0.224, 0.225])
+        ])
+        
+        self.post_transform = T.Compose([
+            T.Resize((post_crop_size, post_crop_size)),
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406],
+                        std=[0.229, 0.224, 0.225])
+        ])
+
+        self.samples = self._gather_samples()
+        if self.max_samples is not None and len(self.samples) > self.max_samples:
+            self.samples = random.sample(self.samples, self.max_samples)
+
+    def _gather_samples(self):
+        samples = []
+        # First try to check if "test" directory has a flat structure
+        images_dir = os.path.join(self.root_dir, "images")
+        labels_dir = os.path.join(self.root_dir, "labels")
+        
+        if os.path.isdir(images_dir) and os.path.isdir(labels_dir):
+            # This looks like a flat structure
+            print(f"Detected flat structure at {self.root_dir}")
+            label_files = [f for f in os.listdir(labels_dir) if f.endswith("_post_disaster.json")]
+            
+            for label_file in label_files:
+                base_id = label_file.replace("_post_disaster.json", "")
+                post_img_name = base_id + "_post_disaster.png"
+                pre_img_name = base_id + "_pre_disaster.png"
+                post_json_path = os.path.join(labels_dir, label_file)
+                post_img_path = os.path.join(images_dir, post_img_name)
+                pre_json_path = os.path.join(labels_dir, base_id + "_pre_disaster.json")
+                pre_img_path = os.path.join(images_dir, pre_img_name)
+                
+                if not (os.path.isfile(post_json_path) and os.path.isfile(post_img_path)
+                        and os.path.isfile(pre_json_path) and os.path.isfile(pre_img_path)):
+                    continue
+                    
+                with open(post_json_path, 'r') as f:
+                    post_data = json.load(f)
+                    
+                feats = post_data.get("features", {}).get(self.coord_key, [])
+                for feat in feats:
+                    damage_type = feat.get("properties", {}).get("subtype", "").lower()
+                    if damage_type not in DAMAGE_LABELS:
+                        continue
+                        
+                    label = DAMAGE_LABELS[damage_type]
+                    wkt_str = feat.get("wkt", None)
+                    if wkt_str is None:
+                        continue
+                        
+                    polygon = wkt.loads(wkt_str)
+                    minx, miny, maxx, maxy = polygon.bounds
+                    samples.append({
+                        "pre_img": pre_img_path,
+                        "post_img": post_img_path,
+                        "bbox": (minx, miny, maxx, maxy),
+                        "label": label
+                    })
+        else:
+            # Hierarchical structure: root_dir contains subfolders per disaster.
+            try:
+                disasters = [d for d in os.listdir(self.root_dir)
+                            if os.path.isdir(os.path.join(self.root_dir, d))
+                            and d.lower() != "spacenet_gt"]
+                
+                print(f"Found {len(disasters)} disaster folders")
+                
+                for disaster in disasters:
+                    disaster_dir = os.path.join(self.root_dir, disaster)
+                    images_dir = os.path.join(disaster_dir, "images")
+                    labels_dir = os.path.join(disaster_dir, "labels")
+                    
+                    if not (os.path.isdir(images_dir) and os.path.isdir(labels_dir)):
+                        print(f"Warning: Missing images or labels directory for disaster: {disaster}")
+                        continue
+                        
+                    label_files = [f for f in os.listdir(labels_dir) if f.endswith("_post_disaster.json")]
+                    print(f"Disaster {disaster}: Found {len(label_files)} label files")
+                    
+                    for label_file in label_files:
+                        base_id = label_file.replace("_post_disaster.json", "")
+                        post_img_name = base_id + "_post_disaster.png"
+                        pre_img_name = base_id + "_pre_disaster.png"
+                        post_json_path = os.path.join(labels_dir, label_file)
+                        post_img_path = os.path.join(images_dir, post_img_name)
+                        pre_json_path = os.path.join(labels_dir, base_id + "_pre_disaster.json")
+                        pre_img_path = os.path.join(images_dir, pre_img_name)
+                        
+                        if not (os.path.isfile(post_json_path) and os.path.isfile(post_img_path)
+                                and os.path.isfile(pre_json_path) and os.path.isfile(pre_img_path)):
+                            continue
+                            
+                        with open(post_json_path, 'r') as f:
+                            post_data = json.load(f)
+                            
+                        feats = post_data.get("features", {}).get(self.coord_key, [])
+                        for feat in feats:
+                            damage_type = feat.get("properties", {}).get("subtype", "").lower()
+                            if damage_type not in DAMAGE_LABELS:
+                                continue
+                                
+                            label = DAMAGE_LABELS[damage_type]
+                            wkt_str = feat.get("wkt", None)
+                            if wkt_str is None:
+                                continue
+                                
+                            polygon = wkt.loads(wkt_str)
+                            minx, miny, maxx, maxy = polygon.bounds
+                            samples.append({
+                                "pre_img": pre_img_path,
+                                "post_img": post_img_path,
+                                "bbox": (minx, miny, maxx, maxy),
+                                "label": label,
+                                "disaster": disaster  # Track which disaster this is from
+                            })
+            except Exception as e:
+                print(f"Error gathering samples: {e}")
+                
+        print(f"Total gathered samples: {len(samples)}")
+        # Check class distribution
+        labels = [s["label"] for s in samples]
+        unique_labels, counts = np.unique(labels, return_counts=True)
+        print("Class distribution:")
+        for label, count in zip(unique_labels, counts):
+            class_name = [name for name, idx in DAMAGE_LABELS.items() if idx == label][0]
+            print(f"  {class_name}: {count} samples ({count/len(samples)*100:.2f}%)")
+            
+        return samples
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        item = self.samples[idx]
+        pre_path = item["pre_img"]
+        post_path = item["post_img"]
+        (minx, miny, maxx, maxy) = item["bbox"]
+        label = item["label"]
+
+        try:
+            pre_img = Image.open(pre_path).convert("RGB")
+            post_img = Image.open(post_path).convert("RGB")
+
+            pre_crop = self._center_crop(pre_img, minx, miny, maxx, maxy, self.pre_crop_size)
+            post_crop = self._center_crop(post_img, minx, miny, maxx, maxy, self.post_crop_size)
+
+            # Use consistent random state for both images
+            if self.augment:
+                seed = np.random.randint(2147483647)
+                random.seed(seed)
+                torch.manual_seed(seed)
+                
+            pre_tensor = self.pre_transform(pre_crop)
+            
+            if self.augment:
+                # Reset the seed for the second transform to ensure same transformation
+                random.seed(seed)
+                torch.manual_seed(seed)
+                
+            post_tensor = self.post_transform(post_crop)
+
+            return pre_tensor, post_tensor, label
+            
+        except Exception as e:
+            print(f"Error processing item {idx}: {e}")
+            # Return a placeholder in case of error
+            placeholder_pre = torch.zeros(3, self.pre_crop_size, self.pre_crop_size)
+            placeholder_post = torch.zeros(3, self.post_crop_size, self.post_crop_size)
+            return placeholder_pre, placeholder_post, label
+
+    def _center_crop(self, pil_img, minx, miny, maxx, maxy, crop_size):
+        width, height = pil_img.size
+        bb_width = maxx - minx
+        bb_height = maxy - miny
+        cx = minx + bb_width / 2.0
+        cy = miny + bb_height / 2.0
+        
+        half = crop_size / 2.0
+        left = max(0, min(cx - half, width - crop_size))
+        top = max(0, min(cy - half, height - crop_size))
+        right = left + crop_size
+        bottom = top + crop_size
+        return pil_img.crop((left, top, right, bottom))
+
+# Model definition
+class AttentionFusion(nn.Module):
+    def __init__(self, in_channels):
+        super(AttentionFusion, self).__init__()
+        self.attention = nn.Sequential(
+            nn.Conv2d(in_channels * 2, in_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, 1, kernel_size=1),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, pre_feat, post_feat):
+        # Make sure the spatial dimensions match before concatenating
+        if pre_feat.shape[2:] != post_feat.shape[2:]:
+            # Resize post_feat to match pre_feat's spatial dimensions
+            post_feat = F.interpolate(post_feat, size=pre_feat.shape[2:], 
+                                      mode='bilinear', align_corners=False)
+            
+        # Concatenate features along channel dimension
+        concat_feat = torch.cat([pre_feat, post_feat], dim=1)
+        # Generate attention weights
+        attn_weights = self.attention(concat_feat)
+        # Apply attention to post features
+        weighted_post = post_feat * attn_weights
+        # Combine pre and weighted post features
+        fused_feat = pre_feat + weighted_post
+        return fused_feat
+
+class BaselineModel(nn.Module):
+    def __init__(self, num_classes=4, pretrained=True, dropout_rate=0.5):
+        super(BaselineModel, self).__init__()
+        
+        # Use a more powerful backbone (ResNet50)
+        try:
+            # For torch 1.13+
+            import torchvision.models as models
+            base_model = models.resnet50(weights='IMAGENET1K_V2' if pretrained else None)
+        except TypeError:
+            # For older torch versions
+            import torchvision.models as models
+            base_model = models.resnet50(pretrained=pretrained)
+        
+        # Pre-disaster branch
+        self.pre_branch = nn.Sequential(*list(base_model.children())[:-2])
+        
+        # Post-disaster branch (same architecture but separate weights)
+        try:
+            # For torch 1.13+
+            import torchvision.models as models
+            post_model = models.resnet50(weights='IMAGENET1K_V2' if pretrained else None)
+        except TypeError:
+            # For older torch versions
+            import torchvision.models as models
+            post_model = models.resnet50(pretrained=pretrained)
+        
+        self.post_branch = nn.Sequential(*list(post_model.children())[:-2])
+        
+        # Get the number of features from the backbone
+        self.feature_dim = base_model.fc.in_features  # 2048 for ResNet50
+        
+        # Attention fusion module to combine features from both branches
+        self.attention_fusion = AttentionFusion(self.feature_dim)
+        
+        # Global average pooling to reduce spatial dimensions
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        
+        # MLP head with dropout for better generalization
+        self.classifier = nn.Sequential(
+            nn.Linear(self.feature_dim, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_rate),
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_rate),
+            nn.Linear(256, num_classes)
+        )
+        
+        # Initialize weights of the classifier
+        self._initialize_weights(self.classifier)
+        
+    def _initialize_weights(self, module):
+        for m in module.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm1d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+                
+    def forward(self, pre_images, post_images):
+        # Extract features from pre-disaster images
+        pre_features = self.pre_branch(pre_images)
+        
+        # Extract features from post-disaster images
+        post_features = self.post_branch(post_images)
+        
+        # Fuse features with attention mechanism
+        fused_features = self.attention_fusion(pre_features, post_features)
+        
+        # Global average pooling
+        pooled_features = self.gap(fused_features).view(-1, self.feature_dim)
+        
+        # Classification
+        output = self.classifier(pooled_features)
+        
+        return output
+
+# Evaluation functions
 def seed_everything(seed=42):
     """Set random seeds for reproducibility."""
     random.seed(seed)
@@ -293,19 +640,89 @@ def analyze_errors(all_preds, all_labels, all_probs, target_names, save_path):
     for i, error in enumerate(error_types):
         print(f"  - {error} (Error rate: {error_rates[i]:.2f})")
 
+def create_versioned_directory(base_path, prefix="evaluationTry"):
+    """Create a versioned directory with incremented try number if base exists."""
+    i = 1
+    while True:
+        dir_name = f"{prefix}{i}"
+        full_path = os.path.join(base_path, dir_name)
+        if not os.path.exists(full_path):
+            os.makedirs(full_path, exist_ok=True)
+            return full_path, i
+        i += 1
+
+def find_best_model(models_dir):
+    """Find the latest best model in the models directory."""
+    # First check for baseline_best.pt
+    baseline_path = os.path.join(models_dir, "baseline_best.pt")
+    if os.path.exists(baseline_path):
+        return baseline_path
+    
+    # Otherwise, look for the best_model_epoch_X.pt file with the highest epoch number
+    model_files = glob.glob(os.path.join(models_dir, "best_model_epoch_*.pt"))
+    if not model_files:
+        return None
+    
+    # Extract epoch numbers and find the highest
+    epoch_numbers = []
+    for file_path in model_files:
+        filename = os.path.basename(file_path)
+        try:
+            epoch = int(filename.replace("best_model_epoch_", "").replace(".pt", ""))
+            epoch_numbers.append((epoch, file_path))
+        except ValueError:
+            continue
+    
+    if not epoch_numbers:
+        return None
+    
+    # Return the path with the highest epoch number
+    return sorted(epoch_numbers, key=lambda x: x[0], reverse=True)[0][1]
+
 def main():
     # Set random seed for reproducibility
     seed_everything(42)
     
+    # Get project root directory
+    project_root = os.path.abspath(os.path.dirname(__file__))
+    # Go up two levels from scripts/training to the project root
+    project_root = os.path.abspath(os.path.join(project_root, "..", ".."))
+    
     # Configuration
     use_tta = True  # Use test-time augmentation
-    checkpoint_name = "baseline_model_final.pt"  # Evaluate the 10th epoch model
+    
+    # Find the latest training directory and best model within it
+    output_dir = os.path.join(project_root, "output")
+    training_dirs = sorted([d for d in os.listdir(output_dir) 
+                           if os.path.isdir(os.path.join(output_dir, d)) and d.startswith("trainingTry")],
+                          key=lambda x: int(x.replace("trainingTry", "")))
+    
+    if not training_dirs:
+        print("No training directories found. Please train a model first.")
+        return
+    
+    latest_training_dir = os.path.join(output_dir, training_dirs[-1])
+    models_dir = os.path.join(latest_training_dir, "models")
+    
+    # Find the best model in the latest training directory
+    best_model_path = find_best_model(models_dir)
+    
+    if not best_model_path:
+        print(f"No model checkpoint found in {models_dir}")
+        return
+    
+    print(f"Using model: {best_model_path}")
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
     # Create timestamp for saving results
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Create versioned results directory
+    base_results_dir = os.path.join(project_root, "evaluation_results")
+    os.makedirs(base_results_dir, exist_ok=True)
+    results_dir, try_num = create_versioned_directory(base_results_dir)
     
     # Test data is stored in a hierarchical structure under data/test
     test_data_dir = os.path.join(project_root, "data", "test")
@@ -317,9 +734,9 @@ def main():
         pre_crop_size=128,
         post_crop_size=224,
         use_xy=True,
-        max_samples=None,  # Limit samples to 1000 for faster evaluation
+        max_samples=None,  # Use all samples for evaluation
         flat_structure=False,  # Test data is hierarchical
-        augment=False         # No augmentation during evaluation
+        augment=False        # No augmentation during evaluation
     )
     print(f"Total evaluation samples: {len(test_dataset)}")
 
@@ -337,13 +754,12 @@ def main():
     model = BaselineModel(num_classes=4).to(device)
     
     # Load checkpoint
-    checkpoint_path = os.path.join(project_root, checkpoint_name)
-    if os.path.isfile(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+    if os.path.isfile(best_model_path):
+        checkpoint = torch.load(best_model_path, map_location=device)
         model.load_state_dict(checkpoint, strict=False)
-        print(f"Loaded model weights from {checkpoint_path}")
+        print(f"Loaded model weights from {best_model_path}")
     else:
-        print(f"Model checkpoint not found at {checkpoint_path}")
+        print(f"Model checkpoint not found at {best_model_path}")
         return
 
     # Evaluate model
@@ -397,22 +813,12 @@ def main():
     print(f"Cohen's Kappa: {kappa:.4f}")
     print(f"Balanced Accuracy: {bal_accuracy:.4f}")
 
-    # Determine the next evaluation try number
-    results_dir = os.path.join(project_root, "evaluation_results")
-    os.makedirs(results_dir, exist_ok=True)
-    try_number = 1
-    while os.path.exists(os.path.join(results_dir, f"evaluationTry{try_number}")):
-        try_number += 1
-
-    # Create directory for this evaluation try
-    try_dir = os.path.join(results_dir, f"evaluationTry{try_number}")
-    os.makedirs(try_dir, exist_ok=True)
-
     # Save detailed results to a text file
-    results_path = os.path.join(try_dir, f"evaluation_results_try{try_number}.txt")
+    results_path = os.path.join(results_dir, f"evaluation_results_try{try_num}.txt")
     with open(results_path, 'w') as f:
-        f.write(f"Evaluation Results for {checkpoint_name}\n")
+        f.write(f"Evaluation Results (Try {try_num})\n")
         f.write(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Model: {best_model_path}\n")
         f.write(f"Test-Time Augmentation: {use_tta}\n\n")
         
         if len(labels) > 0:
@@ -438,20 +844,12 @@ def main():
     
     print(f"Detailed evaluation results saved to {results_path}")
 
-    # Save visualizations to the try directory
-    print(f"Saving visualizations to {try_dir}")
-
-    # Skip plotting if no samples were evaluated
-    if len(labels) == 0 or len(np.unique(labels)) == 0:
-        print("No samples or unique labels to generate visualizations.")
-        return
-
-    # Plot and save confusion matrix
-    cm_save_path = os.path.join(try_dir, "confusion_matrix.png")
+    # Create visualizations 
+    cm_save_path = os.path.join(results_dir, "confusion_matrix.png")
     plot_confusion_matrix(conf_matrix, target_names, cm_save_path, 
                          title=f"Confusion Matrix (Accuracy: {accuracy:.2f}%)")
     
-    cm_norm_save_path = os.path.join(try_dir, "confusion_matrix_normalized.png")
+    cm_norm_save_path = os.path.join(results_dir, "confusion_matrix_normalized.png")
     plot_confusion_matrix(conf_matrix, target_names, cm_norm_save_path, normalize=True,
                          title="Normalized Confusion Matrix")
 
@@ -461,21 +859,21 @@ def main():
         per_class_precision = precision_score(labels, preds, average=None, labels=range(len(target_names)))
         per_class_recall = recall_score(labels, preds, average=None, labels=range(len(target_names)))
         
-        f1_save_path = os.path.join(try_dir, "per_class_f1.png")
+        f1_save_path = os.path.join(results_dir, "per_class_f1.png")
         plot_per_class_metrics(per_class_f1, "F1 Score", target_names, f1_save_path)
         
-        precision_save_path = os.path.join(try_dir, "per_class_precision.png")
+        precision_save_path = os.path.join(results_dir, "per_class_precision.png")
         plot_per_class_metrics(per_class_precision, "Precision", target_names, precision_save_path)
         
-        recall_save_path = os.path.join(try_dir, "per_class_recall.png")
+        recall_save_path = os.path.join(results_dir, "per_class_recall.png")
         plot_per_class_metrics(per_class_recall, "Recall", target_names, recall_save_path)
         
         # Plot ROC curves for multi-class classification
-        roc_save_path = os.path.join(try_dir, "roc_curves.png")
+        roc_save_path = os.path.join(results_dir, "roc_curves.png")
         plot_roc_curves(probs, labels, target_names, roc_save_path)
         
         # Analyze errors
-        error_save_path = os.path.join(try_dir, "error_analysis.png")
+        error_save_path = os.path.join(results_dir, "error_analysis.png")
         analyze_errors(preds, labels, probs, target_names, error_save_path)
     except Exception as e:
         print(f"Error generating metric plots: {e}")

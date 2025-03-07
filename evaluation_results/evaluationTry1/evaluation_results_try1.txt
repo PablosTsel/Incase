@@ -1,33 +1,59 @@
-Evaluation Results for baseline_model_final.pt
-Date: 2025-02-28 01:44:47
+Evaluation Results for baseline_model.pt
+Date: 2025-03-06 11:26:21
 Test-Time Augmentation: True
 
 Confusion Matrix:
-[[36948  3965   326   369]
- [ 1217  3187   269   125]
- [  523   439  2686   202]
- [  522   175   299  2779]]
+[[39042   457   180  1748]
+ [ 2486  1854   305   153]
+ [  846   183  2573   248]
+ [  631    73   229  2842]]
 
 Classification Report:
               precision    recall  f1-score   support
 
-   no-damage     0.9423    0.8880    0.9144     41608
-minor-damage     0.4104    0.6642    0.5073      4798
-major-damage     0.7503    0.6977    0.7230      3850
-   destroyed     0.7997    0.7362    0.7666      3775
+   no-damage     0.9078    0.9424    0.9248     41427
+minor-damage     0.7222    0.3864    0.5035      4798
+major-damage     0.7828    0.6683    0.7210      3850
+   destroyed     0.5694    0.7528    0.6484      3775
 
-    accuracy                         0.8440     54031
-   macro avg     0.7257    0.7465    0.7278     54031
-weighted avg     0.8714    0.8440    0.8543     54031
+    accuracy                         0.8600     53850
+   macro avg     0.7456    0.6875    0.6994     53850
+weighted avg     0.8586    0.8600    0.8533     53850
 
 
 Additional Metrics:
-Accuracy: 84.3960%
-Macro F1 Score: 0.7278
-Weighted F1 Score: 0.8543
-Macro Precision: 0.7257
-Weighted Precision: 0.8714
-Macro Recall: 0.7465
-Weighted Recall: 0.8440
-Cohen's Kappa: 0.6278
-Balanced Accuracy: 0.7465
+Accuracy: 86.0000%
+Macro F1 Score: 0.6994
+Weighted F1 Score: 0.8533
+Macro Precision: 0.7456
+Weighted Precision: 0.8586
+Macro Recall: 0.6875
+Weighted Recall: 0.8600
+Cohen's Kappa: 0.6222
+Balanced Accuracy: 0.6875
+
+Error Analysis:
+  Most common misclassification patterns:
+  - no-damage → destroyed (Error rate: 0.06)
+  - minor-damage → no-damage (Error rate: 0.61)
+  - major-damage → no-damage (Error rate: 0.33)
+  - destroyed → no-damage (Error rate: 0.25)
+
+Sample Predictions (randomly selected):
+Index    True Label      Predicted       Confidence Correct 
+------------------------------------------------------------
+41905    no-damage       no-damage       0.9655      ✓
+7296     no-damage       no-damage       0.9698      ✓
+1639     minor-damage    no-damage       0.7157      ✗
+48598    no-damage       no-damage       0.9732      ✓
+18024    no-damage       no-damage       0.9959      ✓
+16049    no-damage       no-damage       1.0000      ✓
+14628    no-damage       no-damage       0.7693      ✓
+9144     no-damage       no-damage       0.9973      ✓
+48265    no-damage       no-damage       0.9977      ✓
+6717     no-damage       destroyed       0.5016      ✗
+44348    no-damage       no-damage       0.9768      ✓
+48540    no-damage       no-damage       0.9534      ✓
+35741    major-damage    major-damage    1.0000      ✓
+5697     no-damage       no-damage       0.9919      ✓
+38698    no-damage       no-damage       0.9523      ✓
