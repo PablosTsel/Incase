@@ -9,6 +9,6 @@ torchvision
 torchaudio
 scikit-learn
 seaborn
-
-
-
+plotly
+contextily
+shapely

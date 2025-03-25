@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# xBD Building Damage Assessment Model
+# This script implements a deep learning pipeline for detecting building damage
+# from satellite imagery before and after natural disasters
 import os
 import sys
 import torch
@@ -21,6 +24,7 @@ from shapely import wkt
 import shutil  # Added for file operations
 
 # Constants and definitions
+# Dictionary mapping damage category labels to numerical class indices
 DAMAGE_LABELS = {
     "no-damage": 0,
     "minor-damage": 1,
@@ -67,6 +71,7 @@ class XBDPatchDataset(Dataset):
         self.augment = augment
 
         # Basic transforms - keeping it simple for compatibility
+        # Define transforms for pre-disaster images (resize to specified size and normalize)
         self.pre_transform = T.Compose([
             T.Resize((pre_crop_size, pre_crop_size)),
             T.ToTensor(),
@@ -74,6 +79,7 @@ class XBDPatchDataset(Dataset):
                         std=[0.229, 0.224, 0.225])
         ])
         
+        # Define transforms for post-disaster images (resize to specified size and normalize)
         self.post_transform = T.Compose([
             T.Resize((post_crop_size, post_crop_size)),
             T.ToTensor(),
@@ -81,11 +87,19 @@ class XBDPatchDataset(Dataset):
                         std=[0.229, 0.224, 0.225])
         ])
 
+        # Gather all samples from the dataset directory structure
         self.samples = self._gather_samples()
+        
+        # Limit the number of samples if specified
         if self.max_samples is not None and len(self.samples) > self.max_samples:
             self.samples = random.sample(self.samples, self.max_samples)
 
     def _gather_samples(self):
+        """
+        Parse the dataset directory to find all valid sample pairs (pre/post disaster images with labels).
+        Supports both flat and hierarchical directory structures.
+        Returns a list of dictionaries with paths to images and corresponding labels.
+        """
         samples = []
         # First try to check if "test" directory has a flat structure
         images_dir = os.path.join(self.root_dir, "images")
@@ -97,6 +111,7 @@ class XBDPatchDataset(Dataset):
             label_files = [f for f in os.listdir(labels_dir) if f.endswith("_post_disaster.json")]
             
             for label_file in label_files:
+                # Extract base ID from filename (removing the _post_disaster.json suffix)
                 base_id = label_file.replace("_post_disaster.json", "")
                 post_img_name = base_id + "_post_disaster.png"
                 pre_img_name = base_id + "_pre_disaster.png"
@@ -105,24 +120,30 @@ class XBDPatchDataset(Dataset):
                 pre_json_path = os.path.join(labels_dir, base_id + "_pre_disaster.json")
                 pre_img_path = os.path.join(images_dir, pre_img_name)
                 
+                # Skip if any of the required files don't exist
                 if not (os.path.isfile(post_json_path) and os.path.isfile(post_img_path)
                         and os.path.isfile(pre_json_path) and os.path.isfile(pre_img_path)):
                     continue
                     
+                # Load the post-disaster JSON data which contains damage labels
                 with open(post_json_path, 'r') as f:
                     post_data = json.load(f)
                     
+                # Extract feature information from the JSON data
                 feats = post_data.get("features", {}).get(self.coord_key, [])
                 for feat in feats:
+                    # Get the damage type (subtype) and convert to lowercase
                     damage_type = feat.get("properties", {}).get("subtype", "").lower()
                     if damage_type not in DAMAGE_LABELS:
                         continue
                         
+                    # Convert damage type to numerical label
                     label = DAMAGE_LABELS[damage_type]
                     wkt_str = feat.get("wkt", None)
                     if wkt_str is None:
                         continue
                         
+                    # Parse the WKT string to get a polygon object and extract its bounding box
                     polygon = wkt.loads(wkt_str)
                     minx, miny, maxx, maxy = polygon.bounds
                     samples.append({
@@ -134,24 +155,29 @@ class XBDPatchDataset(Dataset):
         else:
             # Hierarchical structure: root_dir contains subfolders per disaster.
             try:
+                # List all directories in the root path (excluding 'spacenet_gt' folder)
                 disasters = [d for d in os.listdir(self.root_dir)
                             if os.path.isdir(os.path.join(self.root_dir, d))
                             and d.lower() != "spacenet_gt"]
                 
                 print(f"Found {len(disasters)} disaster folders")
                 
+                # Process each disaster folder
                 for disaster in disasters:
                     disaster_dir = os.path.join(self.root_dir, disaster)
                     images_dir = os.path.join(disaster_dir, "images")
                     labels_dir = os.path.join(disaster_dir, "labels")
                     
+                    # Skip if images or labels directory is missing
                     if not (os.path.isdir(images_dir) and os.path.isdir(labels_dir)):
                         print(f"Warning: Missing images or labels directory for disaster: {disaster}")
                         continue
                         
+                    # Find all post-disaster JSON files (which contain damage labels)
                     label_files = [f for f in os.listdir(labels_dir) if f.endswith("_post_disaster.json")]
                     print(f"Disaster {disaster}: Found {len(label_files)} label files")
                     
+                    # Process each label file
                     for label_file in label_files:
                         base_id = label_file.replace("_post_disaster.json", "")
                         post_img_name = base_id + "_post_disaster.png"
@@ -161,13 +187,16 @@ class XBDPatchDataset(Dataset):
                         pre_json_path = os.path.join(labels_dir, base_id + "_pre_disaster.json")
                         pre_img_path = os.path.join(images_dir, pre_img_name)
                         
+                        # Skip if any required files are missing
                         if not (os.path.isfile(post_json_path) and os.path.isfile(post_img_path)
                                 and os.path.isfile(pre_json_path) and os.path.isfile(pre_img_path)):
                             continue
                             
+                        # Load the post-disaster JSON data
                         with open(post_json_path, 'r') as f:
                             post_data = json.load(f)
                             
+                        # Process each feature in the JSON data
                         feats = post_data.get("features", {}).get(self.coord_key, [])
                         for feat in feats:
                             damage_type = feat.get("properties", {}).get("subtype", "").lower()
@@ -179,6 +208,7 @@ class XBDPatchDataset(Dataset):
                             if wkt_str is None:
                                 continue
                                 
+                            # Parse the WKT string to get the polygon and extract its bounding box
                             polygon = wkt.loads(wkt_str)
                             minx, miny, maxx, maxy = polygon.bounds
                             samples.append({
@@ -203,9 +233,14 @@ class XBDPatchDataset(Dataset):
         return samples
 
     def __len__(self):
+        """Return the number of samples in the dataset."""
         return len(self.samples)
 
     def __getitem__(self, idx):
+        """
+        Get a single sample from the dataset.
+        Returns pre-disaster image, post-disaster image, and damage label.
+        """
         item = self.samples[idx]
         pre_path = item["pre_img"]
         post_path = item["post_img"]
@@ -213,18 +248,22 @@ class XBDPatchDataset(Dataset):
         label = item["label"]
 
         try:
+            # Load the pre and post disaster images
             pre_img = Image.open(pre_path).convert("RGB")
             post_img = Image.open(post_path).convert("RGB")
 
+            # Crop the images around the building bounding box
             pre_crop = self._center_crop(pre_img, minx, miny, maxx, maxy, self.pre_crop_size)
             post_crop = self._center_crop(post_img, minx, miny, maxx, maxy, self.post_crop_size)
 
-            # Use consistent random state for both images
+            # Use consistent random state for both images if augmentation is enabled
+            # This ensures the same random transformations are applied to both pre and post images
             if self.augment:
                 seed = np.random.randint(2147483647)
                 random.seed(seed)
                 torch.manual_seed(seed)
                 
+            # Apply transformations to pre-disaster image
             pre_tensor = self.pre_transform(pre_crop)
             
             if self.augment:
@@ -232,24 +271,31 @@ class XBDPatchDataset(Dataset):
                 random.seed(seed)
                 torch.manual_seed(seed)
                 
+            # Apply transformations to post-disaster image
             post_tensor = self.post_transform(post_crop)
 
             return pre_tensor, post_tensor, label
             
         except Exception as e:
             print(f"Error processing item {idx}: {e}")
-            # Return a placeholder in case of error
+            # Return a placeholder in case of error (zero tensors and the original label)
             placeholder_pre = torch.zeros(3, self.pre_crop_size, self.pre_crop_size)
             placeholder_post = torch.zeros(3, self.post_crop_size, self.post_crop_size)
             return placeholder_pre, placeholder_post, label
 
     def _center_crop(self, pil_img, minx, miny, maxx, maxy, crop_size):
+        """
+        Crop the image around the center of the given bounding box with specified crop size.
+        Ensures the crop is within the image boundaries.
+        """
         width, height = pil_img.size
         bb_width = maxx - minx
         bb_height = maxy - miny
+        # Find the center of the bounding box
         cx = minx + bb_width / 2.0
         cy = miny + bb_height / 2.0
         
+        # Calculate crop boundaries ensuring they're within image dimensions
         half = crop_size / 2.0
         left = max(0, min(cx - half, width - crop_size))
         top = max(0, min(cy - half, height - crop_size))
@@ -259,17 +305,30 @@ class XBDPatchDataset(Dataset):
 
 # Model definition
 class AttentionFusion(nn.Module):
+    """
+    Attention-based feature fusion module that combines features from pre- and post-disaster images.
+    Uses a learned attention mechanism to focus on the most relevant features for damage assessment.
+    """
     def __init__(self, in_channels):
         super(AttentionFusion, self).__init__()
+        # Attention mechanism implemented as a small convolutional network
         self.attention = nn.Sequential(
             nn.Conv2d(in_channels * 2, in_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(in_channels),
             nn.ReLU(inplace=True),
             nn.Conv2d(in_channels, 1, kernel_size=1),
-            nn.Sigmoid()
+            nn.Sigmoid()  # Outputs values between 0-1 for attention weights
         )
         
     def forward(self, pre_feat, post_feat):
+        """
+        Forward pass of the attention fusion module.
+        Args:
+            pre_feat: Features from pre-disaster image
+            post_feat: Features from post-disaster image
+        Returns:
+            Fused feature map combining information from both inputs
+        """
         # Make sure the spatial dimensions match before concatenating
         if pre_feat.shape[2:] != post_feat.shape[2:]:
             # Resize post_feat to match pre_feat's spatial dimensions
@@ -287,6 +346,11 @@ class AttentionFusion(nn.Module):
         return fused_feat
 
 class BaselineModel(nn.Module):
+    """
+    Siamese-style network that processes pre- and post-disaster images separately,
+    then fuses their features using an attention mechanism.
+    Uses ResNet50 as the backbone for feature extraction.
+    """
     def __init__(self, num_classes=4, pretrained=True, dropout_rate=0.5):
         super(BaselineModel, self).__init__()
         
@@ -304,7 +368,7 @@ class BaselineModel(nn.Module):
                 import torchvision.models as models
                 base_model = models.resnet50(pretrained=pretrained)
         
-        # Pre-disaster branch
+        # Pre-disaster branch - uses layers up to the final FC layer of ResNet50
         self.pre_branch = nn.Sequential(*list(base_model.children())[:-2])
         
         # Post-disaster branch (same architecture but separate weights)
@@ -349,6 +413,7 @@ class BaselineModel(nn.Module):
         self._initialize_weights(self.classifier)
         
     def _initialize_weights(self, module):
+        """Initialize weights of the model layers using Kaiming initialization."""
         for m in module.modules():
             if isinstance(m, nn.Linear):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
@@ -359,6 +424,14 @@ class BaselineModel(nn.Module):
                 nn.init.constant_(m.bias, 0)
                 
     def forward(self, pre_images, post_images):
+        """
+        Forward pass of the model.
+        Args:
+            pre_images: Batch of pre-disaster images
+            post_images: Batch of post-disaster images
+        Returns:
+            Classification logits for the damage categories
+        """
         # Extract features from pre-disaster images
         pre_features = self.pre_branch(pre_images)
         
@@ -378,7 +451,10 @@ class BaselineModel(nn.Module):
 
 # Functions for training
 def seed_everything(seed=42):
-    """Set random seeds for reproducibility."""
+    """
+    Set random seeds for reproducibility across all libraries and components.
+    This helps ensure consistent results between runs.
+    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -390,7 +466,18 @@ def seed_everything(seed=42):
     print(f"Random seed set to {seed}")
 
 def compute_sample_weights(dataset, indices, weight_scale=1.0):
-    """Compute sample weights for the given dataset indices"""
+    """
+    Compute sample weights for the given dataset indices to address class imbalance.
+    
+    Args:
+        dataset: The dataset containing samples
+        indices: Indices of the samples to use for weight calculation
+        weight_scale: Controls the strength of class balancing (higher values give more weight to minority classes)
+    
+    Returns:
+        sample_weights: Weights for each sample
+        class_weights: Weights for each class
+    """
     # Extract labels for the given indices
     labels = [dataset.samples[i]["label"] for i in indices]
     counts = Counter(labels)
@@ -398,6 +485,7 @@ def compute_sample_weights(dataset, indices, weight_scale=1.0):
     num_classes = len(DAMAGE_LABELS)
     
     # Compute inverse frequency weights
+    # Gives higher weights to under-represented classes
     class_weights = {cls: (total / (num_classes * counts[cls]))**weight_scale for cls in counts}
     
     # Create sample weights
@@ -406,7 +494,21 @@ def compute_sample_weights(dataset, indices, weight_scale=1.0):
     return sample_weights, class_weights
 
 def mixup_data(x1, x2, y, alpha=0.2, device='cuda'):
-    """Applies mixup augmentation to the data"""
+    """
+    Applies mixup augmentation to the data.
+    
+    Mixup creates new training examples by linearly interpolating between two random inputs
+    and their corresponding labels.
+    
+    Args:
+        x1, x2: Pre and post disaster input tensors
+        y: Target labels
+        alpha: Parameter for Beta distribution
+        device: Device to use
+    
+    Returns:
+        Mixed inputs, original labels, and mixing coefficient
+    """
     if alpha > 0:
         lam = np.random.beta(alpha, alpha)
     else:
@@ -422,10 +524,33 @@ def mixup_data(x1, x2, y, alpha=0.2, device='cuda'):
     return mixed_x1, mixed_x2, y_a, y_b, lam
 
 def mixup_criterion(criterion, pred, y_a, y_b, lam):
-    """Criterion for mixup training"""
+    """
+    Criterion for mixup training - combines losses using the same mixing coefficient.
+    
+    Args:
+        criterion: Loss function
+        pred: Model predictions
+        y_a, y_b: Original and permuted labels
+        lam: Mixing coefficient
+    
+    Returns:
+        Weighted average of losses for the two labels
+    """
     return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
 def plot_learning_curves(epochs, train_losses, val_losses, val_accuracies, per_class_f1, class_names, save_path):
+    """
+    Plot and save training metrics visualizations.
+    
+    Args:
+        epochs: List of epoch numbers
+        train_losses: Training loss values for each epoch
+        val_losses: Validation loss values for each epoch
+        val_accuracies: Validation accuracy values for each epoch
+        per_class_f1: F1 scores for each class across epochs
+        class_names: Names of damage classes
+        save_path: File path to save the plot
+    """
     plt.figure(figsize=(16, 12))
     
     # Plot loss curves
@@ -473,6 +598,17 @@ def plot_learning_curves(epochs, train_losses, val_losses, val_accuracies, per_c
     print(f"Learning curves plot saved to {save_path}")
 
 class FocalLoss(nn.Module):
+    """
+    Focal Loss for addressing class imbalance.
+    
+    Focal Loss down-weights easy examples (high confidence predictions) and focuses
+    training on hard examples (low confidence), helping with class imbalance.
+    
+    Args:
+        alpha: Optional weight for each class
+        gamma: Focusing parameter (higher values increase focus on hard examples)
+        reduction: How to reduce the loss ('mean', 'sum', or None)
+    """
     def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
         super(FocalLoss, self).__init__()
         self.gamma = gamma
@@ -492,7 +628,18 @@ class FocalLoss(nn.Module):
         return focal_loss
 
 def create_versioned_directory(base_path, prefix="trainingTry"):
-    """Create a versioned directory with incremented try number if base exists."""
+    """
+    Create a versioned directory with incremented try number if base exists.
+    Helps keep track of multiple training runs without overwriting previous results.
+    
+    Args:
+        base_path: Base directory path
+        prefix: Prefix for the directory name
+    
+    Returns:
+        full_path: Path to the created directory
+        i: Version number
+    """
     i = 1
     while True:
         dir_name = f"{prefix}{i}"
@@ -503,6 +650,10 @@ def create_versioned_directory(base_path, prefix="trainingTry"):
         i += 1
 
 def main():
+    """
+    Main function to run the training pipeline.
+    Handles data loading, model training, evaluation, and saving results.
+    """
     start_time = time.time()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     seed_everything(42)
@@ -548,9 +699,11 @@ def main():
         for key, value in config.items():
             f.write(f"{key}: {value}\n")
 
+    # Set device (GPU if available, else CPU)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
+    # Initialize dataset
     print("Initializing XBDPatchDataset for training...")
     full_dataset = XBDPatchDataset(
         root_dir=root_dir,
@@ -564,6 +717,10 @@ def main():
 
     # Create stratified train-val split directly
     def create_stratified_split(dataset, val_ratio=0.15, seed=42):
+        """
+        Create a stratified split of the data ensuring class balance between train and validation sets.
+        Each class will have the same proportion of samples in both train and validation sets.
+        """
         random.seed(seed)
         np.random.seed(seed)
         
@@ -578,13 +735,14 @@ def main():
         train_indices = []
         val_indices = []
         
-        # Stratified sampling
+        # Stratified sampling - take val_ratio proportion from each class
         for label, indices in label_to_indices.items():
             random.shuffle(indices)
             val_size = int(len(indices) * val_ratio)
             val_indices.extend(indices[:val_size])
             train_indices.extend(indices[val_size:])
         
+        # Shuffle the indices to avoid any ordering bias
         random.shuffle(train_indices)
         random.shuffle(val_indices)
         
@@ -603,6 +761,7 @@ def main():
     val_dataset = Subset(full_dataset, val_indices)
     
     # Compute sample weights for weighted sampling
+    # This helps address class imbalance during training
     sample_weights, class_weights = compute_sample_weights(full_dataset, train_indices, weight_scale)
     sampler = torch.utils.data.WeightedRandomSampler(
         weights=sample_weights,
@@ -614,7 +773,7 @@ def main():
     train_loader = DataLoader(
         train_dataset, 
         batch_size=batch_size, 
-        sampler=sampler, 
+        sampler=sampler,  # Use weighted sampler for balanced class distribution
         num_workers=16,
         pin_memory=True,
         drop_last=True
@@ -648,16 +807,18 @@ def main():
         print("Using Weighted CrossEntropyLoss")
     
     # Optimizer with weight decay
+    # AdamW provides better regularization than standard Adam
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     
     # Learning rate scheduler
+    # OneCycleLR gradually increases then decreases learning rate
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer, 
         max_lr=lr,
         epochs=num_epochs,
         steps_per_epoch=len(train_loader),
-        pct_start=0.3,
-        anneal_strategy='cos'
+        pct_start=0.3,  # Percentage of training to increase LR
+        anneal_strategy='cos'  # Use cosine annealing
     )
 
     # Training metrics tracking
@@ -675,6 +836,7 @@ def main():
         running_loss = 0.0
         epoch_start_time = time.time()
         
+        # Training phase
         train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [TRAIN]", leave=True)
         for pre_batch, post_batch, labels in train_pbar:
             pre_batch = pre_batch.to(device)
@@ -688,14 +850,18 @@ def main():
             else:
                 mixup_applied = False
 
+            # Zero gradients before forward pass
             optimizer.zero_grad()
+            # Forward pass
             outputs = model(pre_batch, post_batch)
             
+            # Compute loss based on whether mixup was applied
             if mixup_applied:
                 loss = mixup_criterion(criterion, outputs, labels_a, labels_b, lam)
             else:
                 loss = criterion(outputs, labels)
                 
+            # Backward pass and optimization
             loss.backward()
             optimizer.step()
             scheduler.step()
@@ -703,6 +869,7 @@ def main():
             running_loss += loss.item()
             train_pbar.set_postfix({"loss": f"{loss.item():.4f}"})
             
+        # Calculate average training loss for the epoch
         avg_train_loss = running_loss / len(train_loader)
         train_losses.append(avg_train_loss)
         
@@ -721,25 +888,29 @@ def main():
                 post_batch = post_batch.to(device)
                 labels = labels.to(device)
                 
+                # Forward pass
                 outputs = model(pre_batch, post_batch)
                 loss = criterion(outputs, labels)
                 val_loss_epoch += loss.item()
                 
+                # Get predictions and calculate accuracy
                 _, preds = torch.max(outputs, 1)
                 correct += (preds == labels).sum().item()
                 total += labels.size(0)
                 
+                # Collect predictions and labels for F1 score calculation
                 all_preds.extend(preds.cpu().numpy())
                 all_labels.extend(labels.cpu().numpy())
                 
                 val_pbar.set_postfix({"loss": f"{loss.item():.4f}"})
                 
+        # Calculate average validation loss
         val_loss_epoch /= len(val_loader)
         val_losses.append(val_loss_epoch)
         val_acc = 100 * correct / total if total > 0 else 0
         val_accuracies.append(val_acc)
         
-        # Calculate F1 scores
+        # Calculate F1 scores for each class
         epoch_f1 = f1_score(all_labels, all_preds, average=None, labels=[0, 1, 2, 3])
         per_class_f1_scores.append(epoch_f1)
         
@@ -750,6 +921,7 @@ def main():
         # Calculate elapsed time
         epoch_time = time.time() - epoch_start_time
         
+        # Print epoch summary
         print(f"Epoch [{epoch+1}/{num_epochs}] "
               f"Train Loss: {avg_train_loss:.4f} | "
               f"Val Loss: {val_loss_epoch:.4f} | "

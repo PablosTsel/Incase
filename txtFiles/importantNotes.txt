@@ -1,13 +1,5 @@
+evaluate_baseline:
 #!/usr/bin/env python3
-"""
-Evaluation script for the baseline building damage assessment model.
-
-This script:
-1. Loads a trained model
-2. Evaluates it on the test dataset
-3. Computes detailed metrics and visualizations
-4. Generates comprehensive reports
-"""
 import os
 import sys
 import random
@@ -39,19 +31,15 @@ DAMAGE_LABELS = {
     "destroyed": 3
 }
 
+# Dataset class
 class XBDPatchDataset(Dataset):
     """
-    Dataset for the xBD satellite imagery dataset for building damage assessment.
-    
-    This dataset:
-    1. Loads pre and post-disaster satellite images
-    2. Extracts building polygons from JSON labels
-    3. Crops images around building locations
-    4. Returns (pre_image, post_image, damage_label) for each building
-    
-    Supports both flat and hierarchical data structures:
-    - Flat: root_dir contains 'images' and 'labels' folders directly
-    - Hierarchical: root_dir contains subfolders per disaster, each with 'images' and 'labels'
+    On-the-fly dataset that:
+      - Scans the dataset directory.
+      - In hierarchical mode (flat_structure=False): expects subfolders per disaster (each with an 'images' and 'labels' folder).
+      - In flat mode (flat_structure=True): expects root_dir to contain 'images' and 'labels' folders directly.
+      - For each post-disaster JSON, enumerates building polygons, computes the bounding box, and center-crops the pre & post images.
+      - Returns (pre_patch, post_patch, label) for each building.
     """
     def __init__(self,
                  root_dir,
@@ -62,16 +50,15 @@ class XBDPatchDataset(Dataset):
                  flat_structure=False,
                  augment=False):
         """
-        Initialize the dataset.
-        
-        Args:
-            root_dir (str): Directory containing the dataset
-            pre_crop_size (int): Size to crop pre-disaster images
-            post_crop_size (int): Size to crop post-disaster images
-            use_xy (bool): Use 'xy' coordinates if True, else 'lng_lat'
-            max_samples (int): Limit number of samples (for testing/debugging)
-            flat_structure (bool): If True, root_dir has images/ and labels/ directly
-            augment (bool): Apply data augmentation if True
+        :param root_dir: Directory where the data is stored.
+           - If flat_structure is False: root_dir should contain subfolders for each disaster.
+           - If True: root_dir should contain 'images' and 'labels' folders directly.
+        :param pre_crop_size: Crop size for pre-disaster images.
+        :param post_crop_size: Crop size for post-disaster images.
+        :param use_xy: Use 'xy' coordinates if True; else use 'lng_lat'.
+        :param max_samples: Optional limit on the number of samples.
+        :param flat_structure: Whether the folder structure is flat.
+        :param augment: If True, applies data augmentation (random horizontal flip and random rotation).
         """
         super().__init__()
         self.root_dir = root_dir
@@ -82,11 +69,10 @@ class XBDPatchDataset(Dataset):
         self.flat_structure = flat_structure
         self.augment = augment
 
-        # Define image preprocessing transforms
+        # Basic transforms - keeping it simple for compatibility
         self.pre_transform = T.Compose([
             T.Resize((pre_crop_size, pre_crop_size)),
             T.ToTensor(),
-            # ImageNet normalization values
             T.Normalize(mean=[0.485, 0.456, 0.406],
                         std=[0.229, 0.224, 0.225])
         ])
@@ -94,35 +80,17 @@ class XBDPatchDataset(Dataset):
         self.post_transform = T.Compose([
             T.Resize((post_crop_size, post_crop_size)),
             T.ToTensor(),
-            # ImageNet normalization values
             T.Normalize(mean=[0.485, 0.456, 0.406],
                         std=[0.229, 0.224, 0.225])
         ])
 
-        # Gather all valid samples from the dataset
         self.samples = self._gather_samples()
-        
-        # Limit samples if requested (for testing/debugging)
         if self.max_samples is not None and len(self.samples) > self.max_samples:
             self.samples = random.sample(self.samples, self.max_samples)
 
     def _gather_samples(self):
-        """
-        Scan the dataset directory and gather all valid samples.
-        
-        This method handles both flat and hierarchical directory structures.
-        For each building in the dataset, it:
-        1. Reads the JSON label file
-        2. Extracts building polygons
-        3. Gets damage labels
-        4. Computes bounding boxes
-        
-        Returns:
-            list: List of dictionaries containing sample metadata
-        """
         samples = []
-        
-        # First check if we have a flat structure (images/ and labels/ directly)
+        # First try to check if "test" directory has a flat structure
         images_dir = os.path.join(self.root_dir, "images")
         labels_dir = os.path.join(self.root_dir, "labels")
         
@@ -132,7 +100,6 @@ class XBDPatchDataset(Dataset):
             label_files = [f for f in os.listdir(labels_dir) if f.endswith("_post_disaster.json")]
             
             for label_file in label_files:
-                # Extract base ID from filename (remove _post_disaster.json)
                 base_id = label_file.replace("_post_disaster.json", "")
                 post_img_name = base_id + "_post_disaster.png"
                 pre_img_name = base_id + "_pre_disaster.png"
@@ -141,16 +108,13 @@ class XBDPatchDataset(Dataset):
                 pre_json_path = os.path.join(labels_dir, base_id + "_pre_disaster.json")
                 pre_img_path = os.path.join(images_dir, pre_img_name)
                 
-                # Skip if any files are missing
                 if not (os.path.isfile(post_json_path) and os.path.isfile(post_img_path)
                         and os.path.isfile(pre_json_path) and os.path.isfile(pre_img_path)):
                     continue
                     
-                # Read the JSON file with building annotations
                 with open(post_json_path, 'r') as f:
                     post_data = json.load(f)
                     
-                # Extract building polygons and their damage labels
                 feats = post_data.get("features", {}).get(self.coord_key, [])
                 for feat in feats:
                     damage_type = feat.get("properties", {}).get("subtype", "").lower()
@@ -162,7 +126,6 @@ class XBDPatchDataset(Dataset):
                     if wkt_str is None:
                         continue
                         
-                    # Convert WKT to polygon and get bounding box
                     polygon = wkt.loads(wkt_str)
                     minx, miny, maxx, maxy = polygon.bounds
                     samples.append({
@@ -172,9 +135,8 @@ class XBDPatchDataset(Dataset):
                         "label": label
                     })
         else:
-            # Hierarchical structure: root_dir contains subfolders per disaster
+            # Hierarchical structure: root_dir contains subfolders per disaster.
             try:
-                # Get all disaster directories (excluding any special directories)
                 disasters = [d for d in os.listdir(self.root_dir)
                             if os.path.isdir(os.path.join(self.root_dir, d))
                             and d.lower() != "spacenet_gt"]
@@ -190,12 +152,10 @@ class XBDPatchDataset(Dataset):
                         print(f"Warning: Missing images or labels directory for disaster: {disaster}")
                         continue
                         
-                    # Get all post-disaster JSON files
                     label_files = [f for f in os.listdir(labels_dir) if f.endswith("_post_disaster.json")]
                     print(f"Disaster {disaster}: Found {len(label_files)} label files")
                     
                     for label_file in label_files:
-                        # Extract base ID from filename
                         base_id = label_file.replace("_post_disaster.json", "")
                         post_img_name = base_id + "_post_disaster.png"
                         pre_img_name = base_id + "_pre_disaster.png"
@@ -204,16 +164,13 @@ class XBDPatchDataset(Dataset):
                         pre_json_path = os.path.join(labels_dir, base_id + "_pre_disaster.json")
                         pre_img_path = os.path.join(images_dir, pre_img_name)
                         
-                        # Skip if any files are missing
                         if not (os.path.isfile(post_json_path) and os.path.isfile(post_img_path)
                                 and os.path.isfile(pre_json_path) and os.path.isfile(pre_img_path)):
                             continue
                             
-                        # Read the JSON file with building annotations
                         with open(post_json_path, 'r') as f:
                             post_data = json.load(f)
                             
-                        # Extract building polygons and their damage labels
                         feats = post_data.get("features", {}).get(self.coord_key, [])
                         for feat in feats:
                             damage_type = feat.get("properties", {}).get("subtype", "").lower()
@@ -225,7 +182,6 @@ class XBDPatchDataset(Dataset):
                             if wkt_str is None:
                                 continue
                                 
-                            # Convert WKT to polygon and get bounding box
                             polygon = wkt.loads(wkt_str)
                             minx, miny, maxx, maxy = polygon.bounds
                             samples.append({
@@ -233,14 +189,13 @@ class XBDPatchDataset(Dataset):
                                 "post_img": post_img_path,
                                 "bbox": (minx, miny, maxx, maxy),
                                 "label": label,
-                                "disaster": disaster  # Track source disaster
+                                "disaster": disaster  # Track which disaster this is from
                             })
             except Exception as e:
                 print(f"Error gathering samples: {e}")
                 
         print(f"Total gathered samples: {len(samples)}")
-        
-        # Print class distribution statistics
+        # Check class distribution
         labels = [s["label"] for s in samples]
         unique_labels, counts = np.unique(labels, return_counts=True)
         print("Class distribution:")
@@ -251,24 +206,9 @@ class XBDPatchDataset(Dataset):
         return samples
 
     def __len__(self):
-        """Return the total number of samples in the dataset."""
         return len(self.samples)
 
     def __getitem__(self, idx):
-        """
-        Get a single sample (pre_image, post_image, label) at the given index.
-        
-        This method:
-        1. Loads pre and post-disaster images
-        2. Crops around the building
-        3. Applies transforms and augmentation (if enabled)
-        
-        Args:
-            idx (int): Sample index
-            
-        Returns:
-            tuple: (pre_tensor, post_tensor, label)
-        """
         item = self.samples[idx]
         pre_path = item["pre_img"]
         post_path = item["post_img"]
@@ -276,25 +216,22 @@ class XBDPatchDataset(Dataset):
         label = item["label"]
 
         try:
-            # Load images and convert to RGB
             pre_img = Image.open(pre_path).convert("RGB")
             post_img = Image.open(post_path).convert("RGB")
 
-            # Crop around the building
             pre_crop = self._center_crop(pre_img, minx, miny, maxx, maxy, self.pre_crop_size)
             post_crop = self._center_crop(post_img, minx, miny, maxx, maxy, self.post_crop_size)
 
-            # Use consistent random state for both images when augmenting
+            # Use consistent random state for both images
             if self.augment:
                 seed = np.random.randint(2147483647)
                 random.seed(seed)
                 torch.manual_seed(seed)
                 
-            # Apply transformations
             pre_tensor = self.pre_transform(pre_crop)
             
-            # Reset seed to ensure same transforms for post-image if augmenting
             if self.augment:
+                # Reset the seed for the second transform to ensure same transformation
                 random.seed(seed)
                 torch.manual_seed(seed)
                 
@@ -310,74 +247,33 @@ class XBDPatchDataset(Dataset):
             return placeholder_pre, placeholder_post, label
 
     def _center_crop(self, pil_img, minx, miny, maxx, maxy, crop_size):
-        """
-        Crop an image centered on a building.
-        
-        Args:
-            pil_img (PIL.Image): Image to crop
-            minx, miny, maxx, maxy (float): Bounding box coordinates
-            crop_size (int): Size of the square crop
-            
-        Returns:
-            PIL.Image: Cropped image
-        """
         width, height = pil_img.size
-        
-        # Calculate center of the bounding box
         bb_width = maxx - minx
         bb_height = maxy - miny
         cx = minx + bb_width / 2.0
         cy = miny + bb_height / 2.0
         
-        # Calculate crop boundaries, ensuring they stay within image
         half = crop_size / 2.0
         left = max(0, min(cx - half, width - crop_size))
         top = max(0, min(cy - half, height - crop_size))
         right = left + crop_size
         bottom = top + crop_size
-        
         return pil_img.crop((left, top, right, bottom))
 
+# Model definition
 class AttentionFusion(nn.Module):
-    """
-    Attention Fusion module for combining features from pre and post-disaster branches.
-    
-    This module:
-    1. Concatenates pre and post features
-    2. Computes attention weights
-    3. Applies attention to post features
-    4. Fuses pre and weighted post features
-    """
     def __init__(self, in_channels):
-        """
-        Initialize the attention fusion module.
-        
-        Args:
-            in_channels (int): Number of input feature channels
-        """
         super(AttentionFusion, self).__init__()
-        
-        # Attention mechanism as a small CNN
         self.attention = nn.Sequential(
             nn.Conv2d(in_channels * 2, in_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(in_channels),
             nn.ReLU(inplace=True),
             nn.Conv2d(in_channels, 1, kernel_size=1),
-            nn.Sigmoid()  # Output attention weights between 0-1
+            nn.Sigmoid()
         )
         
     def forward(self, pre_feat, post_feat):
-        """
-        Forward pass of the attention fusion module.
-        
-        Args:
-            pre_feat (Tensor): Features from pre-disaster branch
-            post_feat (Tensor): Features from post-disaster branch
-            
-        Returns:
-            Tensor: Fused features
-        """
-        # Ensure spatial dimensions match before concatenating
+        # Make sure the spatial dimensions match before concatenating
         if pre_feat.shape[2:] != post_feat.shape[2:]:
             # Resize post_feat to match pre_feat's spatial dimensions
             post_feat = F.interpolate(post_feat, size=pre_feat.shape[2:], 
@@ -385,39 +281,19 @@ class AttentionFusion(nn.Module):
             
         # Concatenate features along channel dimension
         concat_feat = torch.cat([pre_feat, post_feat], dim=1)
-        
         # Generate attention weights
         attn_weights = self.attention(concat_feat)
-        
         # Apply attention to post features
         weighted_post = post_feat * attn_weights
-        
         # Combine pre and weighted post features
         fused_feat = pre_feat + weighted_post
-        
         return fused_feat
 
 class BaselineModel(nn.Module):
-    """
-    Baseline model for building damage assessment using pre and post-disaster images.
-    
-    Architecture:
-    - Dual ResNet50 branches for pre and post-disaster images
-    - Attention fusion module to combine features
-    - MLP classifier head
-    """
     def __init__(self, num_classes=4, pretrained=True, dropout_rate=0.5):
-        """
-        Initialize the model.
-        
-        Args:
-            num_classes (int): Number of damage categories
-            pretrained (bool): Whether to use pretrained weights
-            dropout_rate (float): Dropout rate for regularization
-        """
         super(BaselineModel, self).__init__()
         
-        # Use ResNet50 as backbone
+        # Use a more powerful backbone (ResNet50)
         try:
             # For torch 1.13+
             import torchvision.models as models
@@ -427,10 +303,10 @@ class BaselineModel(nn.Module):
             import torchvision.models as models
             base_model = models.resnet50(pretrained=pretrained)
         
-        # Pre-disaster branch - use all layers except final FC
+        # Pre-disaster branch
         self.pre_branch = nn.Sequential(*list(base_model.children())[:-2])
         
-        # Post-disaster branch - same architecture but separate weights
+        # Post-disaster branch (same architecture but separate weights)
         try:
             # For torch 1.13+
             import torchvision.models as models
@@ -442,8 +318,8 @@ class BaselineModel(nn.Module):
         
         self.post_branch = nn.Sequential(*list(post_model.children())[:-2])
         
-        # Number of features from ResNet50 (2048)
-        self.feature_dim = base_model.fc.in_features
+        # Get the number of features from the backbone
+        self.feature_dim = base_model.fc.in_features  # 2048 for ResNet50
         
         # Attention fusion module to combine features from both branches
         self.attention_fusion = AttentionFusion(self.feature_dim)
@@ -451,7 +327,7 @@ class BaselineModel(nn.Module):
         # Global average pooling to reduce spatial dimensions
         self.gap = nn.AdaptiveAvgPool2d(1)
         
-        # MLP classifier head with dropout for better generalization
+        # MLP head with dropout for better generalization
         self.classifier = nn.Sequential(
             nn.Linear(self.feature_dim, 512),
             nn.BatchNorm1d(512),
@@ -468,12 +344,6 @@ class BaselineModel(nn.Module):
         self._initialize_weights(self.classifier)
         
     def _initialize_weights(self, module):
-        """
-        Initialize weights for the given module using Kaiming initialization.
-        
-        Args:
-            module (nn.Module): Module to initialize
-        """
         for m in module.modules():
             if isinstance(m, nn.Linear):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
@@ -484,16 +354,6 @@ class BaselineModel(nn.Module):
                 nn.init.constant_(m.bias, 0)
                 
     def forward(self, pre_images, post_images):
-        """
-        Forward pass of the model.
-        
-        Args:
-            pre_images (Tensor): Pre-disaster images
-            post_images (Tensor): Post-disaster images
-            
-        Returns:
-            Tensor: Class logits
-        """
         # Extract features from pre-disaster images
         pre_features = self.pre_branch(pre_images)
         
@@ -503,7 +363,7 @@ class BaselineModel(nn.Module):
         # Fuse features with attention mechanism
         fused_features = self.attention_fusion(pre_features, post_features)
         
-        # Global average pooling to reduce spatial dimensions
+        # Global average pooling
         pooled_features = self.gap(fused_features).view(-1, self.feature_dim)
         
         # Classification
@@ -513,12 +373,7 @@ class BaselineModel(nn.Module):
 
 # Evaluation functions
 def seed_everything(seed=42):
-    """
-    Set random seeds for reproducibility across all libraries.
-    
-    Args:
-        seed (int): Random seed value
-    """
+    """Set random seeds for reproducibility."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -530,32 +385,15 @@ def seed_everything(seed=42):
     print(f"Random seed set to {seed}")
 
 def test_time_augmentation(model, pre_img, post_img, device, num_augments=5):
-    """
-    Apply test-time augmentation (TTA) to improve prediction robustness.
-    
-    TTA runs multiple forward passes with different augmentations
-    and averages the predictions.
-    
-    Args:
-        model (nn.Module): Model to evaluate
-        pre_img (Tensor): Pre-disaster image batch
-        post_img (Tensor): Post-disaster image batch
-        device (str): Device to use
-        num_augments (int): Number of augmentations to apply
-        
-    Returns:
-        Tensor: Averaged predictions
-    """
+    """Apply test-time augmentation by running multiple forward passes with different augmentations."""
     model.eval()
     batch_size = pre_img.size(0)
     
-    # List to store all predictions
-    all_outputs = []
-    
-    # Original prediction (no augmentation)
+    # Initialize with original predictions
     with torch.no_grad():
         outputs_original = model(pre_img, post_img)
-        all_outputs.append(outputs_original)
+    
+    all_outputs = [outputs_original]
     
     # Horizontal flip augmentation
     with torch.no_grad():
@@ -595,18 +433,7 @@ def test_time_augmentation(model, pre_img, post_img, device, num_augments=5):
     return outputs
 
 def evaluate_model(model, dataloader, device, use_tta=False):
-    """
-    Evaluate model on the given dataloader.
-    
-    Args:
-        model (nn.Module): Model to evaluate
-        dataloader (DataLoader): DataLoader for evaluation
-        device (str): Device to use
-        use_tta (bool): Whether to use test-time augmentation
-        
-    Returns:
-        tuple: (accuracy, predictions, labels, probabilities)
-    """
+    """Evaluate model with optional test-time augmentation."""
     model.eval()
     correct = 0
     total = 0
@@ -648,12 +475,12 @@ def plot_confusion_matrix(cm, target_names, save_path, normalize=False, title=No
     """
     Generate and save a confusion matrix plot.
     
-    Args:
-        cm (ndarray): Confusion matrix from sklearn
-        target_names (list): List of class names
-        save_path (str): Path to save the plot
-        normalize (bool): Whether to normalize values
-        title (str): Title for the plot
+    Parameters:
+    - cm: Confusion matrix from sklearn
+    - target_names: List of class names
+    - save_path: Path to save the plot
+    - normalize: Boolean, whether to normalize values
+    - title: Title for the plot
     """
     if normalize:
         cm = cm.astype('float') / (cm.sum(axis=1)[:, np.newaxis] + 1e-6)
@@ -679,15 +506,7 @@ def plot_confusion_matrix(cm, target_names, save_path, normalize=False, title=No
     plt.close()
 
 def plot_per_class_metrics(metrics, metric_name, target_names, save_path):
-    """
-    Generate and save per-class metrics bar chart.
-    
-    Args:
-        metrics (ndarray): Array of metric values for each class
-        metric_name (str): Name of the metric
-        target_names (list): List of class names
-        save_path (str): Path to save the plot
-    """
+    """Generate and save per-class metrics bar chart."""
     plt.figure(figsize=(12, 6))
     x = np.arange(len(target_names))
     
@@ -716,15 +535,7 @@ def plot_per_class_metrics(metrics, metric_name, target_names, save_path):
     plt.close()
 
 def plot_roc_curves(all_probs, all_labels, target_names, save_path):
-    """
-    Generate and save ROC curves for each class.
-    
-    Args:
-        all_probs (ndarray): Predicted probabilities for each class
-        all_labels (ndarray): True labels
-        target_names (list): List of class names
-        save_path (str): Path to save the plot
-    """
+    """Generate and save ROC curves for each class."""
     plt.figure(figsize=(12, 8))
     
     # One-hot encode the labels for multi-class ROC
@@ -756,25 +567,11 @@ def plot_roc_curves(all_probs, all_labels, target_names, save_path):
     plt.close()
 
 def analyze_errors(all_preds, all_labels, all_probs, target_names, save_path):
-    """
-    Analyze prediction errors to find common patterns.
-    
-    This function:
-    1. Calculates error rates for each class
-    2. Finds common misclassification patterns
-    3. Analyzes confidence distributions
-    
-    Args:
-        all_preds (ndarray): Model predictions
-        all_labels (ndarray): True labels
-        all_probs (ndarray): Prediction probabilities
-        target_names (list): List of class names
-        save_path (str): Path to save the plot
-    """
+    """Analyze prediction errors to find common patterns."""
     # Create a figure for error analysis
     plt.figure(figsize=(12, 8))
     
-    # Get indices of errors and correct predictions
+    # Get indices of errors
     error_idx = np.where(all_preds != all_labels)[0]
     correct_idx = np.where(all_preds == all_labels)[0]
     
@@ -845,16 +642,7 @@ def analyze_errors(all_preds, all_labels, all_probs, target_names, save_path):
         print(f"  - {error} (Error rate: {error_rates[i]:.2f})")
 
 def create_versioned_directory(base_path, prefix="evaluationTry"):
-    """
-    Create a versioned directory with incremented try number.
-    
-    Args:
-        base_path (str): Base directory path
-        prefix (str): Prefix for directory name
-        
-    Returns:
-        tuple: (directory_path, try_number)
-    """
+    """Create a versioned directory with incremented try number if base exists."""
     i = 1
     while True:
         dir_name = f"{prefix}{i}"
@@ -865,18 +653,7 @@ def create_versioned_directory(base_path, prefix="evaluationTry"):
         i += 1
 
 def find_best_model(models_dir):
-    """
-    Find the latest best model in the models directory.
-    
-    This function first looks for baseline_best.pt, and if not found,
-    finds the best_model_epoch_X.pt file with the highest epoch number.
-    
-    Args:
-        models_dir (str): Path to the models directory
-        
-    Returns:
-        str: Path to the best model
-    """
+    """Find the latest best model in the models directory."""
     # First check for baseline_best.pt
     baseline_path = os.path.join(models_dir, "baseline_best.pt")
     if os.path.exists(baseline_path):
@@ -904,16 +681,6 @@ def find_best_model(models_dir):
     return sorted(epoch_numbers, key=lambda x: x[0], reverse=True)[0][1]
 
 def main():
-    """
-    Main evaluation function.
-    
-    This function:
-    1. Sets up the environment (seed, directories)
-    2. Loads the best trained model
-    3. Evaluates it on the test dataset
-    4. Computes detailed metrics
-    5. Generates visualizations and reports
-    """
     # Set random seed for reproducibility
     seed_everything(42)
     
@@ -923,7 +690,7 @@ def main():
     project_root = os.path.abspath(os.path.join(project_root, "..", ".."))
     
     # Configuration
-    use_tta = True  # Use test-time augmentation for more robust predictions
+    use_tta = True  # Use test-time augmentation
     
     # Find the latest training directory and best model within it
     output_dir = os.path.join(project_root, "output")
@@ -935,7 +702,6 @@ def main():
         print("No training directories found. Please train a model first.")
         return
     
-    # Get the latest training directory
     latest_training_dir = os.path.join(output_dir, training_dirs[-1])
     models_dir = os.path.join(latest_training_dir, "models")
     
@@ -948,7 +714,6 @@ def main():
     
     print(f"Using model: {best_model_path}")
     
-    # Set device (GPU if available, else CPU)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
@@ -976,14 +741,14 @@ def main():
     )
     print(f"Total evaluation samples: {len(test_dataset)}")
 
-    # Create test dataloader
+    # Create test dataloader with optimizations
     test_loader = DataLoader(
         test_dataset, 
-        batch_size=32,  # Larger batch size for faster evaluation
-        shuffle=False,  # Don't shuffle for evaluation
-        num_workers=4,  # Parallel data loading
-        pin_memory=True,  # Faster data transfer to GPU
-        persistent_workers=True  # Keep workers alive between iterations
+        batch_size=32,  # Increased batch size for faster evaluation
+        shuffle=False, 
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True
     )
 
     # Initialize model
@@ -998,7 +763,7 @@ def main():
         print(f"Model checkpoint not found at {best_model_path}")
         return
 
-    # Start evaluation
+    # Evaluate model
     print(f"Starting evaluation{' with test-time augmentation' if use_tta else ''}...")
     start_time = time.time()
     accuracy, preds, labels, probs = evaluate_model(model, test_loader, device, use_tta=use_tta)
@@ -1007,7 +772,7 @@ def main():
     print(f"\nEvaluation completed in {eval_time:.2f} seconds")
     print(f"Final Evaluation Accuracy: {accuracy:.2f}%\n")
 
-    # Get class names for visualizations
+    # Compute detailed metrics
     target_names = list(DAMAGE_LABELS.keys())
     
     # Check if there are any predictions
@@ -1020,7 +785,7 @@ def main():
     print("Confusion Matrix:")
     print(conf_matrix)
 
-    # Create classification report
+    # Create classification report with proper handling of empty arrays
     if len(labels) > 0 and len(np.unique(labels)) > 0:
         report = classification_report(labels, preds, target_names=target_names, digits=4)
         print("\nClassification Report:")
@@ -1039,7 +804,6 @@ def main():
         print("No valid labels or predictions to calculate metrics.")
         macro_f1 = weighted_f1 = macro_precision = weighted_precision = macro_recall = weighted_recall = kappa = bal_accuracy = 0.0
 
-    # Print additional metrics
     print("Additional Metrics:")
     print(f"Macro F1 Score: {macro_f1:.4f}")
     print(f"Weighted F1 Score: {weighted_f1:.4f}")
@@ -1092,12 +856,10 @@ def main():
 
     # Plot per-class metrics
     try:
-        # Calculate per-class metrics
         per_class_f1 = f1_score(labels, preds, average=None, labels=range(len(target_names)))
         per_class_precision = precision_score(labels, preds, average=None, labels=range(len(target_names)))
         per_class_recall = recall_score(labels, preds, average=None, labels=range(len(target_names)))
         
-        # Create plots
         f1_save_path = os.path.join(results_dir, "per_class_f1.png")
         plot_per_class_metrics(per_class_f1, "F1 Score", target_names, f1_save_path)
         
@@ -1117,7 +879,7 @@ def main():
     except Exception as e:
         print(f"Error generating metric plots: {e}")
     
-    # Randomly sample predictions to show variety
+    # Randomly sample predictions to show variety if we have predictions
     if len(preds) > 0:
         num_samples = min(15, len(preds))
         sample_indices = random.sample(range(len(preds)), num_samples)
